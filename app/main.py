@@ -64,6 +64,19 @@ from .materializer import (
     MaterializationError,
     materialize_request,
 )
+from .negotiation import (
+    InvalidDocumentError as InvalidNegotiationDocumentError,
+)
+from .negotiation import (
+    InvalidNegotiationRequestError,
+    InvalidSelectorError as InvalidNegotiationSelectorError,
+)
+from .negotiation import (
+    NegotiationContractError,
+    NotAcceptableError,
+    UnsupportedRequestMediaTypeError,
+    negotiate_representations,
+)
 from .overlay import (
     MAX_ACTIONS,
     MIN_ACTIONS,
@@ -189,7 +202,20 @@ app = FastAPI(
         "cannot be located uniquely are all collected and rejected with "
         "422 (no partial graph). Nodes and edges are stably sorted by "
         "JSON Pointer, and a target reached by several declarations "
-        "keeps one edge per declaring source."
+        "keeps one edge per declaring source. "
+        "POST /representations/select performs real HTTP content "
+        "negotiation for one operation: it resolves the requestBody and "
+        "the response selected by exact status code, 'nXX' wildcard or "
+        "'default' (local $refs cycle-safe, OpenAPI 3.1 siblings merged "
+        "and 3.0 ignored), then picks one request representation for "
+        "the concrete request Content-Type (parameter containment, "
+        "wildcard specificity, declaration order) and one response "
+        "representation for the Accept header (RFC 9110 specificity and "
+        "q weights, declaration-order tie-break), returning the source "
+        "JSON Pointers, normalized media types and the schema/examples. "
+        "An unsupported request Content-Type yields 415 and an "
+        "unacceptable response yields 406; any contract error is 422 "
+        "with no partial result and the input is never modified."
     ),
 )
 
@@ -553,6 +579,48 @@ class InteractionGraphRequest(BaseModel):
     )
 
 
+class RepresentationSelectRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document describing the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation to negotiate, in the 'METHOD /path' form "
+            "(e.g. 'POST /pets'); method is case-insensitive."
+        ),
+    )
+    request_content_type: Optional[Any] = Field(
+        default=None,
+        description=(
+            "The actual request 'Content-Type' header value (a concrete "
+            "media type, parameters allowed). Omit/null when the request "
+            "carries no body. An optional requestBody without a Content-Type "
+            "selects no request representation; a required requestBody "
+            "without one is rejected with HTTP 415. Non-string values are "
+            "rejected with HTTP 400."
+        ),
+    )
+    accept: Optional[Any] = Field(
+        default=None,
+        description=(
+            "The actual request 'Accept' header value (comma-separated media "
+            "ranges with optional 'q' weights). Missing/null means '*/*'; an "
+            "empty string explicitly accepts nothing (HTTP 406 when the "
+            "selected response carries content). Non-string values are "
+            "rejected with HTTP 400."
+        ),
+    )
+    status_code: Any = Field(
+        ...,
+        description=(
+            "The actual response status code as an integer (100..599) or a "
+            "digit string. The response is selected in exact-code, 'nXX' "
+            "wildcard (case-insensitive), then 'default' order."
+        ),
+    )
+
+
 class InteractionNodeModel(BaseModel):
     id: str = Field(
         ...,
@@ -868,6 +936,7 @@ def root() -> Dict[str, str]:
         "security_plan": "POST /security/plan",
         "links_plan": "POST /links/plan",
         "interactions_graph": "POST /interactions/graph",
+        "representations_select": "POST /representations/select",
     }
 
 
@@ -1459,3 +1528,101 @@ def interactions_graph(payload: InteractionGraphRequest) -> JSONResponse:
             "edges": graph["edges"],
         },
     )
+
+
+@app.post(
+    "/representations/select",
+    responses={
+        200: {"description": "Exactly one request and one response representation"},
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector is "
+            "malformed/unknown, or the status code / Content-Type / Accept "
+            "envelope is malformed"
+        },
+        406: {
+            "description": "No declared response representation is acceptable "
+            "under the Accept header"
+        },
+        415: {
+            "description": "The request Content-Type matches no declared "
+            "requestBody representation"
+        },
+        422: {
+            "description": "A contract-level structure/reference problem on the "
+            "selected path: no response for the status code, malformed "
+            "requestBody/response/content objects, or a dangling, external, "
+            "non-object or circular local $ref; no partial result is returned"
+        },
+    },
+    summary="Select request/response representations from real HTTP headers",
+)
+def representations_select(payload: RepresentationSelectRequest) -> JSONResponse:
+    try:
+        result = negotiate_representations(
+            payload.document,
+            payload.selector,
+            payload.request_content_type,
+            payload.accept,
+            payload.status_code,
+        )
+    except InvalidNegotiationDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidNegotiationSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidNegotiationRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_negotiation_request",
+                "messages": exc.messages,
+            },
+        )
+    except UnsupportedRequestMediaTypeError as exc:
+        return JSONResponse(
+            status_code=415,
+            content={
+                "error": "unsupported_media_type",
+                "message": (
+                    "the request Content-Type does not match any requestBody "
+                    "representation declared by the operation"
+                ),
+                "request_content_type": exc.content_type,
+                "supported": exc.supported,
+            },
+        )
+    except NotAcceptableError as exc:
+        return JSONResponse(
+            status_code=406,
+            content={
+                "error": "not_acceptable",
+                "message": (
+                    "none of the response representations declared for the "
+                    "selected response is acceptable under the Accept header"
+                ),
+                "accept": exc.accept,
+                "available": exc.available,
+            },
+        )
+    except NegotiationContractError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "negotiation_failed",
+                "message": (
+                    "the representation could not be selected due to a "
+                    "contract-level problem on the selected operation; fix "
+                    "the reported structure or references first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)

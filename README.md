@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供十个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供十一个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -97,6 +97,18 @@
   `operationId`、目标无法唯一定位等问题**一次汇总**返回 **422**，**不返回半成品图**；
   节点与边按 Pointer **稳定排序**，同一目标被多条声明到达时各自保留来源边。
 
+- **`POST /representations/select`**：为**联调时的 HTTP 内容协商**选表示。调用方提交一份
+  OpenAPI 3.x 契约、一个 `METHOD /path` 选择器、**真实请求 `Content-Type`** 与
+  **`Accept`** 头值以及**响应状态码**。服务循环安全地解析所选操作的 `requestBody` 与响应
+  （响应按**精确状态码 → `nXX`（大小写不敏感）→ `default`** 选出；requestBody / Response
+  的本地 `$ref` 在 3.1 下合并同级字段、3.0 下忽略同级），然后按 RFC 9110 分别选出**唯一的
+  请求与响应表示**：请求侧按**媒体类型参数包含关系、通配符具体度、契约声明顺序**匹配具体
+  Content-Type；响应侧由**最具体的可用 Accept 区间**（精确 type/subtype 胜过 `type/*` 胜过
+  `*/*`，匹配参数越多越具体）给出 **q 权重**，最高 q 胜出、同权按声明顺序稳定裁决。返回所用
+  **JSON Pointer、规范化媒体类型以及对应 schema / example / examples**（含经本地 `$ref`
+  引用的 Example Object）。请求 Content-Type 无匹配返回 **415**，Accept 无匹配返回
+  **406**，任一错误都**不返回半成品**且**不修改输入**。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -120,6 +132,7 @@ docker compose up --build
 | 安全方案规划接口 | `POST http://localhost:8080/security/plan` |
 | Link 后续调用计划接口 | `POST http://localhost:8080/links/plan` |
 | 交互图接口 | `POST http://localhost:8080/interactions/graph` |
+| 内容协商选表示接口 | `POST http://localhost:8080/representations/select` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -1515,6 +1528,241 @@ curl -s -X POST http://localhost:8080/interactions/graph \
 > 用 `POST /callbacks/resolve` 代入实际上下文求值），Link 的参数映射也不展开
 > （用 `POST /links/plan` 生成赋值计划）。Docker 与 Docker Compose 的启动方式保持不变。
 
+## `POST /representations/select`：按真实 HTTP 头部协商请求 / 响应表示
+
+用于**联调时确认“这个操作此刻该按哪个媒体类型发请求、按哪个媒体类型收响应”**：给定一份
+OpenAPI 3.x 文档、一个操作选择器、真实请求的 **`Content-Type`** 与 **`Accept`** 头值以及
+**响应状态码**，服务解析该操作的 `requestBody` 与所选响应，按 RFC 9110 内容协商规则分别
+选出**唯一的请求表示与响应表示**，返回所用 **JSON Pointer、规范化媒体类型以及对应
+schema / example / examples**。
+
+### Response 选择顺序
+
+按状态码在操作的 `responses` 中依次选择（与 `/links/plan` 一致）：
+
+1. **精确键**：`200`、`"201"`（整数与数字字符串等价，输出统一为整数）；
+2. **类通配 `nXX`**：无精确键时按首位数字匹配 `2XX` / `4xx` 等，**大小写不敏感**；
+3. **`default`**：兜底响应。
+
+三者都不存在时返回 **422**（`response_not_declared`）。状态码必须是 **100～599** 的整数或
+纯数字字符串，否则 400。
+
+### 请求表示（Content-Type）匹配
+
+请求 `Content-Type` 在 HTTP 线上必须是**具体媒体类型**（不允许 `*/*`，否则 400）。
+在 `requestBody.content` 的声明媒体类型中按下述规则选出唯一一项：
+
+- **type / subtype 大小写不敏感**逐 token 匹配，`*` 为通配（`application/*` 匹配
+  `application/json`；`*/*` 匹配一切；但 `application/*+json` 只与字面同名 token 匹配，
+  不会对 `vnd.api+json` 做后缀子串匹配）。
+- **参数包含关系**：契约声明上的每个参数（如 `version=1`）都必须出现在请求类型上且**值相同**
+  （参数名大小写不敏感、值大小写敏感）；**请求类型允许携带声明未限制的额外参数**
+  （如声明 `application/json` 时请求 `application/json; charset=utf-8` 合法）。
+- **具体度决胜**：通配更少者优先（精确 `type/subtype` > `type/*` > `*/*`）；通档位相同
+  时，与请求**取值相等的参数更多者**优先；仍相同则按 **content 对象的声明顺序**取第一项。
+- 操作无 `requestBody` 时，即使带了 Content-Type 也忽略，`request` 为 `null`；
+  `requestBody` 可选（`required: false`）且未提供 Content-Type 时 `request` 同样为 `null`；
+  **必填**请求体未提供 Content-Type、或 Content-Type 无任何匹配时返回 **415**，
+  响应体 `supported` 列出该请求体声明的全部媒体类型（按声明顺序）。
+
+### 响应表示（Accept）匹配
+
+- `Accept` 按逗号切分成若干媒体区间，每项可带 **`q` 权重**（`0`～`1`，至多三位小数；
+  `q` 名大小写不敏感；带引号的 `q="0.5"` 按 RFC 是名为 `q` 的扩展参数而非权重）。
+- 对每个**声明的响应媒体类型**，在所有**适用**区间（type/subtype 通配匹配、且区间要求的
+  非 q 参数在声明类型上同值齐备；声明类型可有额外参数）中，取**最具体区间**的 q——
+  具体度按 type/subtype 通档位（精确 > `type/*` > `*/*`）再按**匹配上的参数个数**比较，
+  同具体度取**声明在前**的区间。
+- 全体声明类型中 **q 最高且 > 0** 者胜出；**同权按 content 对象声明顺序**稳定裁决。
+- **未提供 / 显式 `null` 的 Accept 等价于 `*/*;q=1`**（取声明第一项）；**空字符串 `""`
+  表示什么都不接受**，所选响应带内容时返回 **406**；`q=0` 区间永不入选。
+- 所选响应**没有 `content`**（如 `204 No Content`）时不做协商，`response.present=false`，
+  任何 Accept 都不会导致 406。406 响应体的 `available` 列出该响应声明的全部媒体类型。
+
+### `$ref` 解析与 3.0 / 3.1 内容对象合并
+
+- `requestBody`、Response 条目与 path item 自身的本地 `$ref`（`#/components/requestBodies`、
+  `#/components/responses`、3.1 `#/components/pathItems` 等）均**循环安全**解析
+  （成环 / 超 100 层 / 悬空 / 外部 / 目标非对象均 422）。
+- **OpenAPI 3.1**：`$ref` 同级字段逐层合并、**近端覆盖**（同名成员整体覆盖，不做深合并）；
+  **OpenAPI 3.0**：严格忽略 `$ref` 同级字段。所选 Media Type Object 的
+  `example` / `examples.<name>` 中的 Example Object 本地 `$ref` 同样跟随解析；
+  `externalValue`、悬空 / 外部 / 循环 Example 引用均 422。
+- Media Type 的 **`schema` 原样返回**（内部 `$ref` 字符串保留、不展开、不校验悬空），
+  以便调用方自行按 schema 指针解析。
+
+### 返回字段
+
+- `operation_pointer`：所选操作的 JSON Pointer。
+- `request`：无请求表示时为 `null`；否则含
+  `present=true`、`required`、收到的规范化 `content_type`、命中的
+  `declared_media_type`（content 对象的原始键）、规范化 `media_type`、
+  `media_type_pointer`、`schema` / `schema_pointer`、内联 `example` /
+  `example_pointer`（无则为 `null`）与 `examples` 数组（每项 `name`、示例条目所在
+  `pointer`、解析后的 `value` 与 `value_pointer`——经 `$ref` 时跟随到组件位置——以及
+  `summary` / `description`；数组按 `name` 排序）。
+- `response`：含 `present`、整数 `status_code`、命中的响应 `key` 与
+  `match`（`exact` / `wildcard` / `default`）、`response_pointer`；`present=true` 时
+  携带与 `request` 相同的媒体类型 / schema / example 字段，`present=false`（无内容响应）时
+  这些字段为 `null` / `[]`。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/representations/select \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": {
+      "openapi": "3.0.3",
+      "info": {"title": "Pet API", "version": "1.0"},
+      "paths": {
+        "/pets": {
+          "post": {
+            "requestBody": {"required": true, "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/Pet"},
+                                   "examples": {"cat": {"$ref": "#/components/examples/Cat"}}},
+              "application/xml": {"schema": {"type": "string"}}
+            }},
+            "responses": {
+              "200": {"description": "a pet", "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/Pet"},
+                                     "example": {"id": 1, "name": "Rex"}},
+                "application/xml": {"schema": {"type": "string"}}
+              }},
+              "4XX": {"description": "problem", "content": {
+                "application/problem+json": {"schema": {"type": "object"}}}},
+              "default": {"description": "unexpected"}
+            }
+          }
+        }
+      },
+      "components": {
+        "schemas": {"Pet": {"type": "object", "required": ["id", "name"],
+                            "properties": {"id": {"type": "integer"}, "name": {"type": "string"}}}},
+        "examples": {"Cat": {"summary": "A cat", "value": {"id": 7, "name": "Milo"}}}
+      }
+    },
+    "selector": "POST /pets",
+    "request_content_type": "application/json; charset=utf-8",
+    "accept": "application/xml;q=0.4, application/json;q=0.9, */*;q=0.1",
+    "status_code": 200
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的单个选择器（方法大小写不敏感，路径逐字匹配；
+  3.1 path-level `$ref` 提供的方法同样认可）。
+- `request_content_type`（可省略 / `null`）：真实请求 Content-Type 头值（具体媒体类型，
+  可带参数）。
+- `accept`（可省略 / `null`）：真实 Accept 头值；省略等价 `*/*`，空字符串拒绝一切。
+- `status_code`（必填）：整数或数字字符串，100～599。
+
+### 成功响应（`200`，节选）
+
+```json
+{
+  "operation_pointer": "/paths/~1pets/post",
+  "request": {
+    "present": true,
+    "required": true,
+    "content_type": "application/json; charset=utf-8",
+    "declared_media_type": "application/json",
+    "media_type": "application/json",
+    "media_type_pointer": "/paths/~1pets/post/requestBody/content/application~1json",
+    "schema": {"$ref": "#/components/schemas/Pet"},
+    "schema_pointer": "/paths/~1pets/post/requestBody/content/application~1json/schema",
+    "example": null,
+    "example_pointer": null,
+    "examples": [
+      {"name": "cat",
+       "pointer": "/paths/~1pets/post/requestBody/content/application~1json/examples/cat",
+       "value": {"id": 7, "name": "Milo"},
+       "value_pointer": "/components/examples/Cat/value",
+       "summary": "A cat", "description": null}
+    ]
+  },
+  "response": {
+    "present": true,
+    "status_code": 200,
+    "key": "200",
+    "match": "exact",
+    "response_pointer": "/paths/~1pets/post/responses/200",
+    "declared_media_type": "application/json",
+    "media_type": "application/json",
+    "media_type_pointer": "/paths/~1pets/post/responses/200/content/application~1json",
+    "schema": {"$ref": "#/components/schemas/Pet"},
+    "schema_pointer": "/paths/~1pets/post/responses/200/content/application~1json/schema",
+    "example": {"id": 1, "name": "Rex"},
+    "example_pointer": "/paths/~1pets/post/responses/200/content/application~1json/example",
+    "examples": []
+  }
+}
+```
+
+> 上例中 `application/json;q=0.9` 比 `application/xml;q=0.4` 权重高，因此尽管 xml 声明在前，
+> 响应仍选 json。把 `status_code` 改为 `404`、`accept` 改为 `application/problem+json`
+> 时，响应命中 `4XX`（`match: "wildcard"`）。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在。
+- `400 invalid_negotiation_request`：`status_code` 非 100～599 整数 / 数字字符串、
+  Content-Type 语法非法或含通配、Accept 区间语法非法（如 `q=2`、`q=0.1234`、`*/json`、
+  重复参数、空区间）、头字段不是字符串等；`messages` 逐条给出原因。
+- **`415 unsupported_media_type`**：请求 Content-Type 不匹配任何请求表示
+  （或必填请求体未给 Content-Type、content 为空）：
+
+```json
+{
+  "error": "unsupported_media_type",
+  "message": "the request Content-Type does not match any requestBody representation declared by the operation",
+  "request_content_type": "text/csv",
+  "supported": ["application/json", "application/xml"]
+}
+```
+
+- **`406 not_acceptable`**：所选响应带内容、但没有任何声明媒体类型可接受（含空 Accept 与
+  全体 `q=0`）：
+
+```json
+{
+  "error": "not_acceptable",
+  "message": "none of the response representations declared for the selected response is acceptable under the Accept header",
+  "accept": "text/html",
+  "available": ["application/json", "application/xml"]
+}
+```
+
+- **`422 negotiation_failed`**：所选路径上的契约结构 / 引用问题，`errors` 每条带
+  `code`、`pointer`、`error`，包括：
+  - `response_not_declared`：状态码无精确 / `nXX` / `default` 响应（附 `status_code`）；
+  - `invalid_operation`：操作 / requestBody / Response / content / Media Type Object 形态非法
+    （如 requestBody 缺 `content`、媒体节点不是对象、`examples` 不是对象、操作缺
+    `responses` 等）；
+  - `invalid_media_type`：content 对象的键不是合法媒体类型（如 `not a media type`）；
+  - `invalid_example`：`examples` 条目经解析后不是 Example Object；
+  - `unsupported_reference`：示例使用 `externalValue`（附该 URL）；
+  - `unresolvable_reference`：requestBody / Response / path item / Example 的本地 `$ref`
+    悬空、外部、指向根 `#`、目标非对象或循环（pointer 指向 `$ref` 出现处，另附 `ref`）。
+
+```json
+{
+  "error": "negotiation_failed",
+  "message": "the representation could not be selected due to a contract-level problem on the selected operation; fix the reported structure or references first",
+  "errors": [
+    {"code": "response_not_declared", "pointer": "/paths/~1pets/post/responses",
+     "status_code": 404,
+     "error": "no response matches status code 404: expected the exact code, an 'nXX' wildcard key or 'default'"}
+  ]
+}
+```
+
+> **错误优先级**：请求包体错误（400）→ 契约结构 / 引用错误（422）→ 请求媒体不支持
+> （415）→ 响应不可接受（406）。任何错误都**不返回半成品**（415 / 406 / 422 响应体不含
+> `request` / `response`）；协商过程**不会修改**请求中的 `document` 与各字段，输出的
+> schema / example 均为深拷贝。Docker 与 Docker Compose 的启动方式保持不变。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -1663,7 +1911,23 @@ Runtime Expression 映射（body/path/query 结构化值允许、header 标量�
 回调操作不再作为边的来源、重复 `operationId` 全局校验（未被 Link 使用也 422）、
 悬空 / 外部 / 循环 / 根引用 422（path item / Response / Link / Callback /
 回调 Path Item 各位置）、非法容器与操作形态 422、错误齐报稳定排序且不返回半成品、
-节点与边按 Pointer 稳定排序、400 文档形态边界、输入不被修改等共 560 个用例。
+节点与边按 Pointer 稳定排序、400 文档形态边界、输入不被修改；
+以及 `/representations/select` 的响应精确 / `nXX`（大小写不敏感、1XX/3XX/5XX）/
+`default` 选择（整数与字符串状态码、无匹配 422、状态码取值校验）、
+请求 Content-Type 匹配（额外参数放行、声明参数必须同值齐备、参数名大小写不敏感 / 值大小写敏感、
+type/subtype 通配与具体度决胜、参数数决胜、同权声明顺序、通配 Content-Type 与语法错误 400、
+必填缺头 / 空 content 415、415 携带 supported 列表）、
+Accept 协商（最具体区间赋 q、`type/*` 与 `*/*` 层次、同权声明顺序、参数包含、
+`q=0` 排除、空 Accept 全拒、缺省 `*/*`、权重数字格式与带引号 q、空白与大小写、
+结构化后缀不做子串匹配、406 携带 available）、
+无请求体 / 可选请求体 / 无内容响应（204 不触发 406）、
+内联 example 与具名 Example Object（含本地 `$ref` 跟随到组件 Pointer、无 value 为 null、
+examples 按名排序）、`externalValue` 422、
+requestBody / Response / path item / Example 本地 `$ref`（多跳、3.0 忽略同级与 3.1
+近端覆盖合并、悬空 / 外部 / 非对象 / 循环 / 根引用 422）、schema 内部 `$ref` 原样返回不展开、
+结构非法（缺 content、非对象 media node、非法媒体类型键、examples 容器）422、
+415 优先于 406、契约 422 优先于协商错误、400 文档 / 选择器 / 信封边界、
+错误不返回半成品与输入对象不被修改等共 633 个用例。
 
 ## 项目结构
 
@@ -1671,7 +1935,7 @@ Runtime Expression 映射（body/path/query 结构化值允许、header 标量�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize、/callbacks/resolve、/security/plan、/links/plan 与 /interactions/graph）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize、/callbacks/resolve、/security/plan、/links/plan、/interactions/graph 与 /representations/select）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
@@ -1681,6 +1945,7 @@ Runtime Expression 映射（body/path/query 结构化值允许、header 标量�
 │   ├── callbacks.py     # 回调 URL 解析（Runtime Expression、JSON Pointer body 片段、循环安全 Callback/Path Item $ref）
 │   ├── linkplanner.py   # Link 后续调用计划（Response 精确/nXX/default 选择、Response/Link/Path Item 循环安全 $ref、operationRef/operationId 定位、参数与请求体表达式求值、来源 Pointer）
 │   ├── interactions.py  # 契约交互图（稳定节点、Link/回调有向边、重复 operationId 校验、错误齐报、Pointer 稳定排序）
+│   ├── negotiation.py   # HTTP 内容协商（Content-Type 参数包含/通配具体度、Accept 最具体区间与 q 权重、精确/nXX/default 响应选择、requestBody/Response/Example 循环安全 $ref、3.0/3.1 同级合并、来源 Pointer）
 │   ├── security.py      # 受保护操作鉴权规划（OR/AND security、方案 $ref 循环解析、apiKey/http/oauth2/openIdConnect 校验、注入位置与来源 Pointer）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
@@ -1693,7 +1958,8 @@ Runtime Expression 映射（body/path/query 结构化值允许、header 标量�
 │   ├── test_callbacks_api.py
 │   ├── test_security_api.py
 │   ├── test_links_api.py
-│   └── test_interactions_api.py
+│   ├── test_interactions_api.py
+│   └── test_negotiation_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt
