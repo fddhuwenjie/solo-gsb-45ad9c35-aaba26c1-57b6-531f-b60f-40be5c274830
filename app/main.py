@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -72,6 +72,19 @@ from .overlay import (
     InvalidOverlayRequestError,
     NoMatchError,
     apply_overlay,
+)
+from .representations import (
+    InvalidDocumentError as InvalidRepresentationDocumentError,
+)
+from .representations import (
+    InvalidRepresentationRequestError,
+    InvalidSelectorError as InvalidRepresentationSelectorError,
+)
+from .representations import (
+    NotAcceptableError,
+    ReferenceOrStructureError,
+    UnsupportedMediaTypeError,
+    select_representations,
 )
 from .slicer import (
     InvalidDocumentError,
@@ -189,9 +202,58 @@ app = FastAPI(
         "cannot be located uniquely are all collected and rejected with "
         "422 (no partial graph). Nodes and edges are stably sorted by "
         "JSON Pointer, and a target reached by several declarations "
-        "keeps one edge per declaring source."
+        "keeps one edge per declaring source. "
+        "POST /representations/select selects the unique request and "
+        "response representations of one operation from the REAL HTTP "
+        "headers of a joint-debugging call: the request Content-Type, the "
+        "Accept list and a concrete response status code. The response is "
+        "chosen by exact code, 'nXX' wildcard then 'default'; Content-Type "
+        "matches when every declared media-type parameter is present on the "
+        "wire; Accept honors RFC 7231 specificity and q weights with "
+        "contract declaration order as the stable tie-break. It returns the "
+        "JSON Pointer, normalized media type and deep-copied schema/example "
+        "of each representation. Unmatched Content-Type is 415, unmatched "
+        "Accept is 406, contract/reference errors are 422; no partial result "
+        "is ever returned and the input is never modified."
     ),
 )
+
+
+class RepresentationSelectRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document declaring the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation whose representations are selected, in the "
+            "'METHOD /path' form (e.g. 'POST /pets'); method is "
+            "case-insensitive."
+        ),
+    )
+    content_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "The real request Content-Type header value (one concrete media "
+            "type, parameters allowed; e.g. 'application/json; charset=utf-8'). "
+            "Omit/null when the request has no body or no Content-Type."
+        ),
+    )
+    accept: Optional[str] = Field(
+        default=None,
+        description=(
+            "The real request Accept header value (comma-separated media "
+            "ranges with q weights, e.g. 'application/json;q=0.9, */*;q=0.1'). "
+            "Omit/null is equivalent to '*/*'."
+        ),
+    )
+    status_code: Union[int, str] = Field(
+        ...,
+        description=(
+            "The concrete response status code of the joint-debugging call, "
+            "an integer (200) or a 3-digit string ('201') in 100..599."
+        ),
+    )
 
 
 class AuditRequest(BaseModel):
@@ -868,6 +930,7 @@ def root() -> Dict[str, str]:
         "security_plan": "POST /security/plan",
         "links_plan": "POST /links/plan",
         "interactions_graph": "POST /interactions/graph",
+        "representations_select": "POST /representations/select",
     }
 
 
@@ -1459,3 +1522,94 @@ def interactions_graph(payload: InteractionGraphRequest) -> JSONResponse:
             "edges": graph["edges"],
         },
     )
+
+
+@app.post(
+    "/representations/select",
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector is "
+            "malformed/unknown, or the Content-Type/Accept header values or "
+            "status code are malformed"
+        },
+        406: {
+            "description": "No declared response media type is acceptable per "
+            "the request Accept header"
+        },
+        415: {
+            "description": "The request Content-Type matches no requestBody media type"
+        },
+        422: {
+            "description": "The operation/requestBody/response container is "
+            "malformed, the status code is undeclared, or a reachable local "
+            "$ref is dangling, external or circular; no partial result is "
+            "returned"
+        },
+    },
+    summary="Select request/response representations from real HTTP headers",
+)
+def representations_select(payload: RepresentationSelectRequest) -> JSONResponse:
+    try:
+        result = select_representations(
+            payload.document,
+            payload.selector,
+            payload.content_type,
+            payload.accept,
+            payload.status_code,
+        )
+    except InvalidRepresentationDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidRepresentationSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidRepresentationRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_representation_request",
+                "messages": exc.messages,
+            },
+        )
+    except UnsupportedMediaTypeError as exc:
+        return JSONResponse(
+            status_code=415,
+            content={
+                "error": "unsupported_media_type",
+                "message": exc.message,
+                "offered_media_type": exc.offered,
+                "supported_media_types": exc.supported,
+                "content_pointer": exc.content_pointer,
+            },
+        )
+    except NotAcceptableError as exc:
+        return JSONResponse(
+            status_code=406,
+            content={
+                "error": "not_acceptable",
+                "message": exc.message,
+                "accept": exc.accept,
+                "supported_media_types": exc.supported,
+                "content_pointer": exc.content_pointer,
+            },
+        )
+    except ReferenceOrStructureError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "representation_selection_failed",
+                "message": (
+                    "the representations could not be selected; fix the reported "
+                    "contract nodes or references first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)
